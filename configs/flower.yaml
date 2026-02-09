@@ -1,0 +1,34 @@
+# 以下四个参数 即可启动相机
+camera_name: "hikrobot"                                           # 相机名称    相机需要
+exposure_ms: 64                                                   # 曝光时间    相机需要
+gain: 10.0                                                        # 未知       相机需要
+vid_pid: "2bdf:0001"                                              # 未知       相机需要
+
+# 以下几个参数 即可启用YOLO
+yolo_name: yolov5                                                 # 模型名称        YOLO需要
+classify_model: assets/tiny_resnet.onnx                           # 未知使用        未知需要
+yolo11_model_path: assets/yolo11.xml                              # 模型路径        YOLO需要
+yolov8_model_path: assets/yolov8.xml                              # 模型路径        YOLO需要
+# yolov5_model_path: assets/yolov5.xml                              # 模型路径        YOLO需要
+yolov5_model_path: assets/yolov5s_best.rknn                        # 模型路径        YOLO需要
+device: NPU                                                       # CPU和GPU       YOLO需要
+min_confidence: 0.8                                               # 未知作用        YOLO需要
+use_traditional: true                                             # 是否传统        YOLO需要
+
+roi:                                                              # 感兴趣区        YOLO需要
+  x: 420                                                          # x坐标          YOLO需要
+  y: 50                                                           # y坐标          YOLO需要
+  width: 600                                                      # 宽度           YOLO需要
+  height: 600                                                     # 高度           YOLO需要
+use_roi: false                                                    # 是否启用        YOLO需要
+
+threshold: 150                                                    # 阈值           YOLO需要 探测需要
+max_angle_error: 45                                               # 最大角度错误     探测需要
+min_lightbar_ratio: 1.5                                           # 未知           探测需要
+max_lightbar_ratio: 20                                            # 未知           探测需要
+min_lightbar_length: 8                                            # 未知           探测需要
+min_armor_ratio: 1                                                # 未知           探测需要
+max_armor_ratio: 5                                                # 未知           探测需要
+max_side_ratio: 1.5                                               # 未知           探测需要
+max_rectangular_error: 25                                         # 未知           探测需要
+min_confidence: 0.8                                               # 未知           探测需要
