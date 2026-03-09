@@ -2,109 +2,105 @@
 #include <stdio.h>
 #include <unistd.h>
 #include <fcntl.h>
-#include <termios.h>
 #include <errno.h>
+#include <iostream>
+#include <cstring>                                    // 提供 strerror
+#include <cerrno>                                     // 提供 errno
 
 namespace io
 {
-static int fd = -1;                                            // 串口文件描述符
-
-int usb_open(const char *device)
+Flower_USB::Flower_USB(const char* device_path)
+    : fd_(-1), running_(true)
 {
-  fd = open(device, O_RDWR | O_NOCTTY);                   // 可读写，且不让该设备成为进程的控制终端
-  if (fd == -1)
-  {
-    perror("open");
-    return -1;
-  }
-
-  struct termios tty;                                          // 此结构体用于获取当前串口设备的终端属性
-  // 用于获取与文件描述符 fd 关联的终端设备的当前属性，并将这些属性填充到 tty 结构体中
-  if (tcgetattr(fd, &tty) != 0)
-  {
-    perror("tcgetattr");
-    close(fd);
-    fd = -1;
-    return -1;
-  }
-  cfsetospeed(&tty, B9600);                             // 输入波特率为9600
-  cfsetispeed(&tty, B9600);                             // 输出波特率为9600
-
-  // 控制模式标志
-  tty.c_cflag |= (CLOCAL | CREAD);                            // 启用接收器，忽略调制解调器控制线
-  tty.c_cflag &= ~CSIZE;                                      // 清除数据位设置
-  tty.c_cflag |= CS8;                                         // 8 位数据
-  tty.c_cflag &= ~PARENB;                                     // 无奇偶校验
-  tty.c_cflag &= ~CSTOPB;                                     // 1 位停止位
-  tty.c_cflag &= ~CRTSCTS;                                    // 禁用硬件流控
-  // 本地模式 - 原始输入
-  tty.c_lflag &= ~(ICANON | ECHO | ISIG);                     // 非规范模式，无回显，无信号
-  // 输入模式 - 禁用软件流控和字符转换
-  tty.c_iflag &= ~(IXON | IXOFF | IXANY);
-  tty.c_iflag &= ~(INLCR | ICRNL | IGNCR);
-  // 输出模式 - 原始输出
-  tty.c_oflag &= ~OPOST;
-  // 设置读取超时：VMIN=0, VTIME=10 表示等待 1 秒（10*0.1秒）后返回，即使没有数据
-  tty.c_cc[VMIN] = 0;
-  tty.c_cc[VTIME] = 1;                                        // 单位：0.1 秒
-  // 应用设置
-  if (tcsetattr(fd, TCSANOW, &tty) != 0)
-  {
-    perror("tcsetattr");
-    close(fd);
-    fd = -1;
-    return -1;
-  }
-  printf("USB device %s opened successfully.\n", device);
-  return 0;
+    // 打开 USB 设备（以读写方式、非阻塞？可选项）
+    fd_ = open(device_path, O_RDWR | O_NOCTTY);
+    if (fd_ < 0)
+    {
+        // 记录错误，但继续运行（线程不会做实际发送）
+        // 可以用日志系统，这里简单输出
+        std::cerr << "Failed to open " << device_path << ": " << strerror(errno) << std::endl;
+        return;
+    }
+    // 可设置串口参数（如波特率等），此处省略，假设已配置好
+    // 启动发送线程
+    sender_thread_ = std::thread(&Flower_USB::sender_loop, this);
 }
 
-void usb_close(void)
+Flower_USB::~Flower_USB()
 {
-  if (fd != -1)
-  {
-    close(fd);
-    fd = -1;
-    printf("USB device closed.\n");
-  }
+    stop();
 }
 
-// 将用户空间的数据拷贝到内核的串口发送缓冲区，然后由驱动程序通过硬件逐位发送
-int usb_send(const char *data, size_t len)
+void Flower_USB::send(const std::string& data)
 {
-  if (fd == -1)
-  {
-    errno = EBADF;
-    return -1;
-  }
-  ssize_t n = write(fd, data, len);
-  if (n < 0)
-  {
-    perror("write");
-    return -1;
-  }
-  return (int)n;
+    if (!running_) return;                                            // 已停止，不再接收新数据
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        queue_.push(data);
+    }
+    cond_.notify_one();                                               // 唤醒发送线程
 }
 
-// 接收数据
-// 数据从硬件到达后，确实会先存放在内核的串口接收缓冲区中，然后应用程序通过 read 读取
-// 这个内核缓冲区的工作方式和你担心的“覆盖”不同——它本质上是一个先进先出的队列，而不是一个只保存最新数据的寄存器
-// 当接收速度持续快于读取速度时，缓冲区会逐渐被填满。一旦缓冲区满，再到达的新数据将无处存放，这时通常会丢弃新数据
-int usb_recv(char *buf, size_t maxlen)
+void Flower_USB::stop()
 {
-  if (fd == -1)
-  {
-    errno = EBADF;
-    return -1;
-  }
+    if (!running_) return;
+    running_ = false;
+    cond_.notify_all();                                               // 唤醒发送线程，让其检查 running_ 并退出
+    if (sender_thread_.joinable())
+    {
+        sender_thread_.join();                                        //
+    }
 
-  ssize_t n = read(fd, buf, maxlen);
-  if (n < 0)
-  {
-    perror("read");
-    return -1;
-  }
-  return (int)n;
+    if (fd_ >= 0)
+    {
+        close(fd_);
+        fd_ = -1;
+    }
+}
+
+void Flower_USB::sender_loop()
+{
+    while (running_)                                                // running_ 控制循环是否继续
+    {
+        std::string data;
+        {
+            std::unique_lock<std::mutex> lock(mutex_);
+
+            // 让发送线程在“无数据且未收到停止信号”时休眠，一旦有数据入队或要求停止，线程就会被唤醒并执行相应操作
+            cond_.wait(lock, [this] { return !queue_.empty() || !running_; });
+
+            if (!running_ && queue_.empty())                        // 收到停止信号且队列为空，退出循环
+            {
+                break;
+            }
+            if (!queue_.empty())
+            {
+                data = std::move(queue_.front());
+                queue_.pop();
+            }
+        }
+        // 发送数据（如果设备打开）
+        if (fd_ >= 0 && !data.empty())                              // 发送数据
+        {
+            if (!usb_send_raw(data.c_str(), data.size()))
+            {
+                // 发送失败，可以记录日志，这里简单忽略
+            }
+        }
+    }
+}
+
+bool Flower_USB::usb_send_raw(const char* data, size_t len)
+{
+    ssize_t ret = write(fd_, data, len);
+    if (ret < 0)
+    {
+        // 错误处理
+        return false;
+    }
+    // 如果发送部分字节，可以重试，为简化这里认为必须一次发完
+    // 若未发完，可以缓存剩余部分，但简单场景下忽略
+    return (size_t)ret == len;
 }
 
 }
