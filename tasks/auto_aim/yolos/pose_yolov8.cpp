@@ -392,7 +392,6 @@ std::list<Pose> Pose_YOLOv8::parse_outputs(double scale, int pad_left, int pad_t
   // ./build/flower_test
   if (debug_)
   {
-    printf("test");
     draw_detections(raw_img, poses, frame_count);
   }
   
@@ -411,7 +410,6 @@ void Pose_YOLOv8::draw_detections(const cv::Mat &img, const std::list<Pose> &pos
   if (use_roi_)
     cv::rectangle(detection, roi_, cv::Scalar(0, 255, 0), 2);
   cv::resize(detection, detection, {}, 0.5, 0.5);
-  printf("test2");
   cv::imshow("human detection", detection);
 }
 
