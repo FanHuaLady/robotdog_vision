@@ -1,29 +1,46 @@
 #include "flower_usb.hpp"
-#include <stdio.h>
-#include <unistd.h>
 #include <fcntl.h>
+#include <unistd.h>
+#include <termios.h>
 #include <errno.h>
+#include <cstring>
 #include <iostream>
-#include <cstring>                                    // 提供 strerror
-#include <cerrno>                                     // 提供 errno
+#include <chrono>
+#include <thread>
+#include <cstdio>
+#include <cctype>   // for isprint
 
 namespace io
 {
+
 Flower_USB::Flower_USB(const char* device_path)
     : fd_(-1), running_(true)
 {
-    // 打开 USB 设备（以读写方式、非阻塞？可选项）
     fd_ = open(device_path, O_RDWR | O_NOCTTY);
     if (fd_ < 0)
     {
-        // 记录错误，但继续运行（线程不会做实际发送）
-        // 可以用日志系统，这里简单输出
         std::cerr << "Failed to open " << device_path << ": " << strerror(errno) << std::endl;
         return;
     }
-    // 可设置串口参数（如波特率等），此处省略，假设已配置好
-    // 启动发送线程
+
+    // 设置为非阻塞模式
+    int flags = fcntl(fd_, F_GETFL, 0);
+    if (flags != -1)
+    {
+        fcntl(fd_, F_SETFL, flags | O_NONBLOCK);
+    }
+
+    // 设置为原始模式，避免行缓冲和转换
+    struct termios tty;
+    if (tcgetattr(fd_, &tty) == 0)
+    {
+        cfmakeraw(&tty);
+        tcsetattr(fd_, TCSANOW, &tty);
+    }
+
+    // 启动线程
     sender_thread_ = std::thread(&Flower_USB::sender_loop, this);
+    receiver_thread_ = std::thread(&Flower_USB::receiver_loop, this);
 }
 
 Flower_USB::~Flower_USB()
@@ -33,26 +50,32 @@ Flower_USB::~Flower_USB()
 
 void Flower_USB::send(const std::string& data)
 {
-    if (!running_) return;                                            // 已停止，不再接收新数据
+    if (!running_) return;
     {
-        std::lock_guard<std::mutex> lock(mutex_);
-        queue_.push(data);
+        std::lock_guard<std::mutex> lock(send_mutex_);
+        send_queue_.push(data);
     }
-    cond_.notify_one();                                               // 唤醒发送线程
+    send_cond_.notify_one();
+}
+
+std::string Flower_USB::try_receive()
+{
+    std::lock_guard<std::mutex> lock(recv_mutex_);
+    if (recv_queue_.empty()) {
+        return {};
+    }
+    std::string line = std::move(recv_queue_.front());
+    recv_queue_.pop();
+    return line;
 }
 
 void Flower_USB::stop()
 {
-    if (!running_) return;
-    running_ = false;
-    cond_.notify_all();                                               // 唤醒发送线程，让其检查 running_ 并退出
-    if (sender_thread_.joinable())
-    {
-        sender_thread_.join();                                        //
-    }
-
-    if (fd_ >= 0)
-    {
+    if (!running_.exchange(false)) return;
+    send_cond_.notify_all();  // 唤醒发送线程
+    if (sender_thread_.joinable()) sender_thread_.join();
+    if (receiver_thread_.joinable()) receiver_thread_.join();
+    if (fd_ >= 0) {
         close(fd_);
         fd_ = -1;
     }
@@ -60,47 +83,82 @@ void Flower_USB::stop()
 
 void Flower_USB::sender_loop()
 {
-    while (running_)                                                // running_ 控制循环是否继续
+    while (running_)
     {
         std::string data;
         {
-            std::unique_lock<std::mutex> lock(mutex_);
-
-            // 让发送线程在“无数据且未收到停止信号”时休眠，一旦有数据入队或要求停止，线程就会被唤醒并执行相应操作
-            cond_.wait(lock, [this] { return !queue_.empty() || !running_; });
-
-            if (!running_ && queue_.empty())                        // 收到停止信号且队列为空，退出循环
-            {
-                break;
-            }
-            if (!queue_.empty())
-            {
-                data = std::move(queue_.front());
-                queue_.pop();
+            std::unique_lock<std::mutex> lock(send_mutex_);
+            send_cond_.wait(lock, [this] { return !send_queue_.empty() || !running_; });
+            if (!running_ && send_queue_.empty()) break;
+            if (!send_queue_.empty()) {
+                data = std::move(send_queue_.front());
+                send_queue_.pop();
             }
         }
-        // 发送数据（如果设备打开）
-        if (fd_ >= 0 && !data.empty())                              // 发送数据
-        {
-            if (!usb_send_raw(data.c_str(), data.size()))
-            {
-                // 发送失败，可以记录日志，这里简单忽略
+
+        if (fd_ < 0 || data.empty()) continue;
+
+        ssize_t ret = write(fd_, data.c_str(), data.size());
+        if (ret < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                // 暂时不可写，放回队尾稍后重试
+                std::lock_guard<std::mutex> lock(send_mutex_);
+                send_queue_.push(data);
+                std::this_thread::sleep_for(std::chrono::microseconds(100));
+            } else {
+                // 硬错误，丢弃数据
+                std::cerr << "USB write error: " << strerror(errno) << std::endl;
             }
+        } else if ((size_t)ret < data.size()) {
+            // 部分发送，剩余部分重新入队
+            std::string remaining = data.substr(ret);
+            std::lock_guard<std::mutex> lock(send_mutex_);
+            send_queue_.push(remaining);
+            send_cond_.notify_one();  // 立即继续发送剩余部分
         }
+        // 全部发送成功则继续循环
     }
 }
 
-bool Flower_USB::usb_send_raw(const char* data, size_t len)
+void Flower_USB::receiver_loop()
 {
-    ssize_t ret = write(fd_, data, len);
-    if (ret < 0)
+    const size_t buf_size = 256;
+    char buf[buf_size];
+    while (running_)
     {
-        // 错误处理
-        return false;
+        if (fd_ < 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            continue;
+        }
+
+        ssize_t n = read(fd_, buf, buf_size);
+        if (n > 0) 
+        {
+            recv_buffer_.append(buf, n);
+            size_t pos;
+            while ((pos = recv_buffer_.find('\n')) != std::string::npos) {
+                std::string line = recv_buffer_.substr(0, pos);
+                if (!line.empty() && line.back() == '\r') line.pop_back(); // 去除可能结尾的 \r
+                {
+                    std::lock_guard<std::mutex> lock(recv_mutex_);
+                    recv_queue_.push(line);
+                }
+                recv_buffer_.erase(0, pos + 1);
+            }
+        } else if (n == 0) {
+            // 可能设备关闭，短暂休眠
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        } else {
+            if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                // 读错误
+                std::cerr << "USB read error: " << strerror(errno) << std::endl;
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            } else {
+                // 无数据，短暂休眠
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+        }
     }
-    // 如果发送部分字节，可以重试，为简化这里认为必须一次发完
-    // 若未发完，可以缓存剩余部分，但简单场景下忽略
-    return (size_t)ret == len;
 }
 
-}
+} // namespace io
